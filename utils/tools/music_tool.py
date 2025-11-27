@@ -87,17 +87,18 @@ class SpotifyTool:
             track_title = tracks[0]['name']
             artist_name = tracks[0]['artists'][0]['name']
 
-            devices = self.sp.devices()
+            devices = self.sp.devices() # Get Active devices active devices
 
             if not devices['devices']:
-                app_open, _ = self._open_spotify_app()
+                app_open, _ = self._open_spotify_app() # Try to open Spotify App
                 if not app_open:
-                    web_open, _ = self._fallback_web_player()
+                    web_open, _ = self._fallback_web_player() # Fallback to web player
                     if not web_open:
                         raise Exception("No active Spotify device found and unable to open Spotify app or web player.")
                 
                 device_id = self._wait_for_device()
-
+            else:
+                device_id = devices['devices'][0]['id'] # Use the first available device
             self.sp.start_playback(device_id=device_id, uris=[track_uri])
 
             return f"Now Playing: '{track_title}' by {artist_name}'"
