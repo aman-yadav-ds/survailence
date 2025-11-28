@@ -7,6 +7,7 @@ requires-python = ">=3.12,<3.13"
 dependencies = [
     "edge-tts>=7.2.3",
     "faster-whisper>=1.2.1",
+    "google-genai>=1.52.0",
     "google-generativeai>=0.8.5",
     "librosa>=0.11.0",
     "mediapipe>=0.10.14",
@@ -20,6 +21,7 @@ dependencies = [
     "speechrecognition>=3.14.4",
     "spotipy>=2.25.2",
     "torch>=2.9.1",
+    "torchaudio>=2.9.1",
     "torchvision>=0.24.1",
     "whisper>=1.1.10",
 ]
