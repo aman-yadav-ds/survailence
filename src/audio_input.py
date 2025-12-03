@@ -5,7 +5,11 @@ import pyaudio
 import torch
 import wave
 import time
-from faster_whisper import WhisperModel
+import os
+import google.generativeai as genai
+from dotenv import load_dotenv
+
+load_dotenv()
 
 class AudioInput:
     def __init__(self, stop_event):
@@ -28,15 +32,20 @@ class AudioInput:
         # RMS = Volume. How loud are you screaming?
         self.RMS_THRESHOLD = 200      # Silence threshold. Don't transcribe breathing.
         self.BARGE_IN_RMS = 3000      # Interruption threshold. You gotta yell to stop the bot.
-        self.BARGE_IN_CONFIDENCE = 0.7 # VAD confidence. Are we SURE it's a human?
+        self.BARGE_IN_CONFIDENCE = 0.8 # Higher confidence for barge-in to avoid false positives.
         
         # Are we currently blabbering?
         self.is_speaking = False
         
         # --- Brain Transplants ---
-        print("Loading Whisper... (The ears)")
-        # Using 'small' because we like speed. Int8 because we like RAM.
-        self.stt_model = WhisperModel("small", device="cpu", compute_type="int8")
+        print("Loading Gemini STT... (The ears)")
+        
+        api_key = os.getenv("GEMINI_API_KEY")
+        if not api_key:
+            raise ValueError("GEMINI_API_KEY not found in environment variables")
+            
+        genai.configure(api_key=api_key)
+        self.stt_model = genai.GenerativeModel("gemini-2.5-flash")
         
         print("Loading Silero VAD... (The reflex)")
         # This thing is crazy fast at telling speech from a car horn.
@@ -80,11 +89,11 @@ class AudioInput:
         print("\n🎤 Listening... (Say 'Exit' to stop)")
 
         audio_buffer = []
-        started_talking = False
+        is_recording = False
         silence_counter = 0
-        silence_limit = 60 # ~2 seconds of silence = "I'm done talking."
-        phrase_limit = 15  # ~0.5 seconds = "I'm taking a breath."
-        phrase_processed = False
+        # 16000 Hz / 512 samples per chunk ~= 31.25 chunks per second
+        # 1.5 seconds of silence to stop recording
+        silence_limit = int(1.5 * (self.RATE / self.CHUNKS)) 
         
         # The conveyor belt to the Brain (transcription_loop)
         self.transcription_queue = asyncio.Queue()
@@ -108,53 +117,49 @@ class AudioInput:
             # Ask the VAD model: "Is this speech?" (returns 0.0 to 1.0)
             voice_confidence = self.vad_model(torch.from_numpy(audio_float32), self.RATE).item()
             
-            # --- The "Shut Up" Logic ---
-            # If the AI is talking, we need to be LOUDER to interrupt it.
-            # Otherwise, it hears its own voice and thinks "Wow, I'm interrupting myself!"
-            # Solving this issue gave me the run for my money.
+            # --- Interruption & Speech Detection Logic ---
+            
+            # 1. Check for Interruption (Barge-In)
             if self.is_speaking:
-                is_speech = (voice_confidence > self.BARGE_IN_CONFIDENCE) and (rms > self.BARGE_IN_RMS)
-            else:
-                is_speech = (voice_confidence > 0.5) and (rms > self.RMS_THRESHOLD)
-
-            if is_speech:
-                # If we detect speech while the AI is talking, SHUT IT UP!
-                if self.is_speaking:
+                # If AI is talking, we need high confidence and volume to interrupt
+                if (voice_confidence > self.BARGE_IN_CONFIDENCE) and (rms > self.BARGE_IN_RMS):
                     print("\n🛑 Interruption detected! Stopping AI...")
-                    self.stop_event.set() # Signal the output module to stop
+                    self.stop_event.set() # Kill the output
                     self.is_speaking = False
-                
-                if not started_talking:
-                    print(f"\n🗣️ User started speaking...")
-                    started_talking = True
-                    audio_buffer = []
-                    phrase_processed = False
-                
-                silence_counter = 0
-                audio_buffer.append(data)
-                phrase_processed = False
-                
-            elif started_talking:
-                # User was talking, but now it's silent.
-                audio_buffer.append(data)
-                silence_counter += 1
-                
-                # If silent for a bit, try to transcribe what we have (Incremental STT)
-                # This makes it feel faster because we don't wait for the full sentence.
-                if silence_counter > phrase_limit and not phrase_processed:
-                    await self.process_audio_input(audio_buffer, is_final=False)
-                    phrase_processed = True
-                
-                # If silent for a long time, assume the user is done.
-                if silence_counter > silence_limit:
-                    print("🔇 End of speech detected.")
-                    await self.process_audio_input(audio_buffer, is_final=True)
                     
-                    # Reset everything for the next turn
-                    started_talking = False
+                    # Start recording immediately
+                    if not is_recording:
+                        print(f"\n🗣️ User started speaking (Interruption)...")
+                        is_recording = True
+                        audio_buffer = []
+                        silence_counter = 0
+            
+            # 2. Check for Normal Speech Start
+            elif not is_recording:
+                if (voice_confidence > 0.5) and (rms > self.RMS_THRESHOLD):
+                    print(f"\n🗣️ User started speaking...")
+                    is_recording = True
                     audio_buffer = []
                     silence_counter = 0
-                    phrase_processed = False
+
+            # 3. Recording State
+            if is_recording:
+                audio_buffer.append(data)
+                
+                # Check for Silence (End of Turn)
+                if (voice_confidence < 0.5) or (rms < self.RMS_THRESHOLD):
+                    silence_counter += 1
+                else:
+                    silence_counter = 0 # Reset if we hear speech again
+                
+                if silence_counter > silence_limit:
+                    print("🔇 End of speech detected.")
+                    is_recording = False
+                    
+                    # Send the full buffer to be transcribed
+                    await self.process_audio_input(audio_buffer, is_final=True)
+                    audio_buffer = []
+                    silence_counter = 0
 
     async def process_audio_input(self, audio_buffer, is_final=False):
         """Helper to prepare audio data for the transcriber."""
@@ -171,47 +176,56 @@ class AudioInput:
     async def transcription_loop(self):
         """
         The 'Translator' Loop.
-        Takes raw audio bytes and turns them into words using Whisper.
-        It's like a court stenographer, but digital and less likely to get carpal tunnel.
+        Takes raw audio bytes and turns them into words using Gemini.
         """
-        accumulated_text = ""
         while True:
             audio_data, is_final = await self.transcription_queue.get()
             
-            print(f"👂 Transcribing segment...")
-            segments, _ = self.stt_model.transcribe(
-                    audio_data, 
-                    beam_size=1, 
-                    language="en", 
-                    task="transcribe",
-                    vad_filter=True, # Double check silence with Whisper's internal VAD (belt and suspenders)
-                    vad_parameters=dict(min_silence_duration_ms=500)
+            # We only care about final segments now
+            if not is_final:
+                self.transcription_queue.task_done()
+                continue
+                
+            print(f"👂 Transcribing full turn...")
+            
+            try:
+                # Convert float32 back to int16 for wav encoding
+                audio_int16 = (audio_data * 32767).astype(np.int16)
+                
+                # Create a WAV file in memory
+                import io
+                wav_io = io.BytesIO()
+                with wave.open(wav_io, "wb") as wf:
+                    wf.setnchannels(1)
+                    wf.setsampwidth(2)
+                    wf.setframerate(16000)
+                    wf.writeframes(audio_int16.tobytes())
+                
+                wav_data = wav_io.getvalue()
+                
+                # Generate content using Gemini with lower temperature for accuracy
+                response = self.stt_model.generate_content(
+                    [
+                        "You are an expert speech-to-text transcriber. Transcribe the following audio exactly as spoken. "
+                        "Do not add any commentary, markdown, or extra text. If the audio is silent or unintelligible, return an empty string.",
+                        {"mime_type": "audio/wav", "data": wav_data}
+                    ],
+                    generation_config={"temperature": 0.0}
                 )
-            
-            text_parts = []
-            for segment in segments:
-                # Filter out "hallucinations" (when the model guesses but isn't sure)
-                if segment.avg_logprob > -1.0:
-                    text_parts.append(segment.text)
-                else:
-                    print(f"⚠️ Ignored low confidence segment: '{segment.text}' ({segment.avg_logprob:.2f})")
-            
-            text = "".join(text_parts).strip()
-            
-            # Filter out common "ghost" phrases Whisper hears in silence
-            # Just don't thank the Agent, It'll ignore it.
+                
+                text = response.text.strip() if response.text else ""
+                
+            except Exception as e:
+                print(f"⚠️ Transcription error: {e}")
+                text = ""
+
+            # Filter out common "ghost" phrases
             if text.lower() in ["thank you.", "thank you", "you", "thanks."]:
                  print(f"⚠️ Ignored hallucination: '{text}'")
                  text = ""
 
             if text:
-                accumulated_text = text
-                print(f"📝 Partial: {accumulated_text}")
-            
-            # Only send the text to the Main Brain if it's the FINAL part of the sentence
-            if is_final:
-                if accumulated_text:
-                    await self.text_queue.put(accumulated_text)
-                    accumulated_text = ""
+                print(f"📝 Final Transcript: {text}")
+                await self.text_queue.put(text)
             
             self.transcription_queue.task_done()
