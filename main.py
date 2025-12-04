@@ -7,17 +7,18 @@ from src.audio_output import AudioOutput
 
 async def main_loop():
     """
-    The Big Boss. The Conductor. The Main Loop.
-    This ties the Ear, Brain, and Mouth together into one somewhat cohesive unit.
+    The Big Boss. The Conductor. The Main Loop. 🎩
+    This function ties the Ear, Brain, and Mouth together into one somewhat cohesive unit.
+    It's the puppet master pulling the strings.
     """
     print("✅ Agent is locked and loaded!")
     
     # The "Shut Up" Button
-    # If this gets set, we kill the audio output immediately.
+    # If this event is set, the Mouth stops talking immediately.
     stop_speaking_event = asyncio.Event()
     
     # --- The Crew ---
-    # 1. The Ear: Handles the mic and figures out if you're actually talking.
+    # 1. The Ear: Handles the mic, VAD, and transcription.
     audio_input = AudioInput(stop_speaking_event)
     
     # 2. The Brain: The smart part (hopefully). Talks to Gemini.
@@ -27,7 +28,7 @@ async def main_loop():
     audio_output = AudioOutput(stop_speaking_event)
     
     # --- Spin up the background workers ---
-    # These guys run forever, doing the heavy lifting.
+    # These guys run forever, doing the heavy lifting in the background.
     await audio_input.start()
     await audio_output.start()
     
@@ -36,7 +37,10 @@ async def main_loop():
         user_text = await audio_input.text_queue.get()
         print(f"👤 You said (Final): {user_text}")
 
-        if "exit" in user_text.lower():
+        # Check for exit commands
+        # Because sometimes you just need some peace and quiet.
+        exit_phrases = ["exit", "shutdown", "you can sleep"]
+        if any(phrase in user_text.lower() for phrase in exit_phrases):
             print("Catch you on the flip side!")
             os._exit(0)
 
@@ -60,4 +64,5 @@ if __name__ == "__main__":
     try:
         asyncio.run(main_loop())
     except KeyboardInterrupt:
+        # Graceful exit on Ctrl+C
         pass

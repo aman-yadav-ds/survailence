@@ -2,30 +2,31 @@ import asyncio
 import edge_tts
 import pygame
 import io
-import os
+import re
 
 class AudioOutput:
     """
-    The 'Mouth' of the AI.
-    It takes text and turns it into sound waves. Magic.
+    The 'Mouth' of the operation. 🗣️
+    Converts text to speech using Edge TTS and plays it back via Pygame.
     """
     def __init__(self, stop_event):
         self.stop_event = stop_event
-        # Queue to hold audio streams waiting to be played
+        # Queue for holding audio streams. FIFO (First In, First Out).
         self.audio_queue = asyncio.Queue()
-        # Initialize Pygame mixer for audio playback
+        # Initialize the DJ (Pygame Mixer)
         pygame.mixer.init()
         
     async def start(self):
-        """Starts the background playback loop."""
+        """Kicks off the background playback loop."""
         asyncio.create_task(self.playback_loop())
 
     async def generate_audio_stream(self, text):
         """
-        Uses Edge TTS to convert text -> audio bytes.
-        Returns an in-memory stream (BytesIO) because saving files to disk is so 2010.
+        The Voice Box. 🎙️
+        Uses Edge TTS to generate audio bytes from text.
+        Returns an in-memory BytesIO stream because disk I/O is for chumps.
         """
-        communicate = edge_tts.Communicate(text, "en-US-AndrewMultilingualNeural")
+        communicate = edge_tts.Communicate(text, "en-US-EmmaNeural")
         audio_data = b""
         async for chunk in communicate.stream():
             if chunk["type"] == "audio":
@@ -34,39 +35,41 @@ class AudioOutput:
 
     async def play_audio_stream(self, audio_stream):
         """
-        Plays a single audio stream using Pygame.
-        Checks 'stop_event' constantly so we can shut it up instantly if needed.
+        The Speaker. 🔊
+        Plays a single audio stream. Monitors the 'stop_event' like a hawk
+        to cut off speech instantly if interrupted.
         """
         audio_stream.seek(0)
         try:
             pygame.mixer.music.load(audio_stream)
             pygame.mixer.music.play()
             
-            # Wait while audio is playing...
+            # Busy wait loop for playback
             while pygame.mixer.music.get_busy():
-                # If user interrupted, STOP immediately!
+                # The "Shut Up" check
                 if self.stop_event.is_set():
                     pygame.mixer.music.stop()
                     pygame.mixer.music.unload()
                     return False
-                await asyncio.sleep(0.05)
+                # Low latency sleep for quick reaction time
+                await asyncio.sleep(0.01)
             
             pygame.mixer.music.unload()
             return True
         except Exception as e:
-            print(f"Error playing audio: {e}")
+            print(f"⚠️ Audio playback error: {e}")
             return True
 
     async def playback_loop(self):
         """
-        The DJ Booth.
-        Endlessly pulls audio tracks from the queue and plays them.
-        This allows us to 'pipeline' audio: generating sentence 2 while playing sentence 1.
+        The DJ Booth. 🎧
+        Continuously pulls tracks from the queue and spins them.
+        Allows for pipelining: generating the next sentence while playing the current one.
         """
         while True:
             audio_stream = await self.audio_queue.get()
             
-            # If we were interrupted, discard this audio chunk
+            # Check if we should skip this track (interruption)
             if self.stop_event.is_set():
                 self.audio_queue.task_done()
                 continue
@@ -76,18 +79,18 @@ class AudioOutput:
 
     async def speak(self, text_stream, on_start_speaking=None):
         """
-        Takes a stream of text from the LLM, breaks it into sentences,
-        and queues them up for the DJ.
+        The Orator. 📜
+        Consumes a stream of text tokens, assembles them into sentences,
+        and queues them for playback.
         """
         text_buffer = ""
-        import re
         
         for chunk in text_stream:
-            # If interrupted, stop processing the LLM stream
+            # Check for interruption
             if self.stop_event.is_set():
                 break
             
-            # Handle different chunk types (LangChain vs Google SDK vs String)
+            # Extract text from various chunk types
             text_chunk = ""
             if hasattr(chunk, "content"):
                 text_chunk = chunk.content # LangChain
@@ -99,8 +102,9 @@ class AudioOutput:
             if text_chunk:
                 text_buffer += text_chunk
                 
-                # Check for sentence endings (. ? !)
+                # Sentence boundary detection
                 if any(punct in text_buffer for punct in [".", "?", "!"]):
+                    # Split by sentence endings, keeping the delimiter
                     sentences = re.split(r'(?<=[.?!])\s+', text_buffer)
                     
                     # Process all complete sentences
@@ -108,21 +112,19 @@ class AudioOutput:
                         if self.stop_event.is_set():
                             break
                         
-                        # Notify that we are about to speak (so VAD knows to expect noise)
-                        # "Hey Ear, cover your ears, I'm about to yell!"
+                        # Signal start of speech (e.g., to pause VAD)
                         if on_start_speaking:
                             on_start_speaking()
                             
                         print(f"🗣️ AI Speaking: {sentence}")
                         
-                        # Generate audio in background
+                        # Generate and queue audio
                         audio_stream = await self.generate_audio_stream(sentence)
-                        # Add to playback queue
                         await self.audio_queue.put(audio_stream)
                         
                     text_buffer = sentences[-1]
         
-        # Process any remaining text (the last sentence)
+        # Flush remaining text
         if text_buffer and not self.stop_event.is_set():
             if on_start_speaking:
                 on_start_speaking()
@@ -130,5 +132,5 @@ class AudioOutput:
             audio_stream = await self.generate_audio_stream(text_buffer)
             await self.audio_queue.put(audio_stream)
             
-        # Wait for all audio to finish playing
+        # Wait for the queue to drain
         await self.audio_queue.join()
